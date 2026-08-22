@@ -1,10 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
+import hashlib
+import hmac
+import time
+import os
 
 app = FastAPI()
 
-# Libera acesso para qualquer site (Netlify/Tiiny)
+# Libera acesso para seu site no Tiiny/Netlify
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,34 +16,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
-    return {"status": "Servidor Agente Viral Online"}
+# Pega suas chaves oficiais do Render
+PARTNER_ID = os.getenv("SHOPEE_APP_ID")
+PARTNER_KEY = os.getenv("SHOPEE_APP_KEY")
+
+def generate_sign(path, params):
+    """Cria a assinatura oficial exigida pela Shopee Open Platform"""
+    if not PARTNER_KEY:
+        return ""
+    
+    # Ordena os parâmetros alfabeticamente
+    sorted_params = sorted(params.items())
+    base_string = f"{PARTNER_ID}{path}"
+    
+    for key, value in sorted_params:
+        base_string += f"{key}{value}"
+        
+    # Gera o hash HMAC-SHA256
+    sign = hmac.new(
+        PARTNER_KEY.encode('utf-8'),
+        base_string.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    
+    return sign
 
 @app.get("/search")
 async def search_products(keyword: str):
-    try:
-        # Busca direta na API pública da Shopee Brasil
-        url = f"https://shopee.com.br/api/v4/search/search_items?by=relevancy&keyword={keyword}&limit=6&newest=0"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://shopee.com.br/"
-        }
+    if not PARTNER_ID or not PARTNER_KEY:
+        return {"products": [], "error": "Chaves da Shopee não configuradas no servidor"}
 
-        resp = requests.get(url, headers=headers, timeout=10)
-        data = resp.json()
+    # Endpoint oficial de busca de afiliados
+    api_path = "/api/v2/item/search"
+    base_url = f"https://partner.shopeemobile.com{api_path}"
+    
+    timestamp = int(time.time())
+    
+    # Parâmetros obrigatórios da API v2
+    params = {
+        "partner_id": int(PARTNER_ID),
+        "timestamp": timestamp,
+        "keyword": keyword,
+        "limit": 10,
+        "offset": 0
+    }
+    
+    # Gera a assinatura oficial
+    params["sign"] = generate_sign(api_path, params)
+    
+    try:
+        response = requests.get(base_url, params=params, timeout=10)
+        data = response.json()
         
         products = []
-        for item in data.get("items", []):
+        # A resposta oficial vem dentro de "response" -> "item_list"
+        item_list = data.get("response", {}).get("item_list", [])
+        
+        for item in item_list:
             img = item.get("item_image", "")
+            # A Shopee às vezes manda só o caminho da imagem
             if img and not img.startswith("http"):
-                img = f"https://cf.shopee.com.br/file/{img}"
+                img = f"https://{img}"
             
-            price = item.get("price_min_before_discount", item.get("price_min", 0)) / 100000
+            # Preço vem em micro-centavos (divide por 100000)
+            price = float(item.get("item_price", 0)) / 100000
             
             products.append({
-                "title": item.get("name", "Produto"),
+                "title": item.get("item_name", "Produto sem nome"),
                 "price": f"{price:.2f}",
                 "image": img,
                 "sold": item.get("historical_sold", 0)
@@ -48,10 +91,8 @@ async def search_products(keyword: str):
         return {"products": products}
         
     except Exception as e:
-        # Fallback seguro se a Shopee bloquear
-        return {"products": [
-            {"title": f"Achadinho: {keyword}", "price": "29.90", "image": "https://via.placeholder.com/300x200?text=Shopee+Viral", "sold": 1000}
-        ]}
+        print(f"Erro na API Oficial Shopee: {e}")
+        return {"products": [], "debug": str(e)}
 
 @app.post("/generate")
 async def generate_video(data: dict):
